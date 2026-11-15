@@ -1,0 +1,21 @@
+config global 'global'
+	option interval '10'
+	option timeout '3000'
+	option count '1'
+	option buzzer_mode 'driver'
+	option buzzer_dev ''
+	option fallback_http '1'
+	option buzzer_enable '1'
+	option alarm_freq '2000'
+	option alarm_ms '300'
+	option alarm_repeat '3'
+	option alarm_gap '150'
+	option max_alarms '5'
+	option log_file '/root/pingbell/pingbell.log'
+	option log_max_kb '512'
+
+# 规则默认留空，用 LuCI 界面（服务 → PingBell → 添加规则）
+# 或者 CLI 自己加：
+#   pingbell add office_gw type=icmp   iface=wan host=1.1.1.1
+#   pingbell add nas       type=tcping host=192.168.10.10 port=443
+# 接口名填本机 netifd 里的逻辑接口（`ubus list network.interface` 可查）。

@@ -1,0 +1,17 @@
+#!/bin/sh
+# 首次安装时 补齐默认选项，启用开机自启，启动服务
+[ -f /etc/config/pingbell ] || exit 0
+
+uci -q get pingbell.global.buzzer_mode >/dev/null || \
+	uci set pingbell.global.buzzer_mode='driver'
+uci -q get pingbell.global.fallback_http >/dev/null || \
+	uci set pingbell.global.fallback_http='1'
+uci -q get pingbell.global.timeout >/dev/null || \
+	uci set pingbell.global.timeout='3000'
+uci commit pingbell
+
+/etc/init.d/pingbell enable
+/etc/init.d/pingbell restart
+
+rm -rf /tmp/luci-indexcache*
+exit 0

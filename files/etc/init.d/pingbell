@@ -1,0 +1,32 @@
+#!/bin/sh /etc/rc.common
+# pingbell — 链路健康检测守护进程（procd）
+
+START=96
+STOP=10
+USE_PROCD=1
+
+PROG=/usr/local/bin/pingbell
+PY=/usr/bin/python3
+
+start_service() {
+	# 蜂鸣器驱动
+	modprobe snd-pcsp 2>/dev/null
+
+	procd_open_instance
+	procd_set_param command "$PY" "$PROG" daemon
+	procd_set_param respawn 3600 5 5
+	procd_close_instance
+}
+
+reload_service() {
+	# uci改动后热重载
+	if [ -f /var/run/pingbell.pid ]; then
+		kill -HUP "$(cat /var/run/pingbell.pid)" 2>/dev/null && echo "PingBell reloaded"
+	else
+		echo "PingBell 未运行"
+	fi
+}
+
+service_triggers() {
+	procd_add_reload_trigger "pingbell"
+}

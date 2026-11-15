@@ -1,0 +1,36 @@
+{
+	"admin/services/pingbell": {
+		"title": "PingBell",
+		"order": 60,
+		"action": {
+			"type": "firstchild"
+		},
+		"depends": {
+			"acl": [ "luci-app-pingbell" ]
+		}
+	},
+	"admin/services/pingbell/link": {
+		"title": "链路监控",
+		"order": 10,
+		"action": {
+			"type": "view",
+			"path": "pingbell/link"
+		}
+	},
+	"admin/services/pingbell/lan": {
+		"title": "内网监控",
+		"order": 20,
+		"action": {
+			"type": "view",
+			"path": "pingbell/lan"
+		}
+	},
+	"admin/services/pingbell/settings": {
+		"title": "设置",
+		"order": 30,
+		"action": {
+			"type": "view",
+			"path": "pingbell/settings"
+		}
+	}
+}

@@ -1,0 +1,20 @@
+{
+	"luci-app-pingbell": {
+		"description": "Grant access to pingbell CLI and its UCI configuration",
+		"read": {
+			"ubus": {
+				"luci": [ "getBoardJSON" ]
+			},
+			"uci": [ "pingbell" ],
+			"file": {
+				"/usr/local/bin/pingbell": [ "exec" ]
+			}
+		},
+		"write": {
+			"uci": [ "pingbell" ],
+			"file": {
+				"/usr/local/bin/pingbell": [ "exec" ]
+			}
+		}
+	}
+}

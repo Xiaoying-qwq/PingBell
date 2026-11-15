@@ -1,0 +1,1140 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+"""
+PingBell链路健康检测 蜂鸣器报警
+"""
+
+import glob
+import json
+import os
+import random
+import re
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import time
+import urllib.request
+
+CONF = "pingbell"
+STATE_PATH = "/tmp/pingbell.state.json"
+PID_PATH = "/var/run/pingbell.pid"
+DEFAULT_LOG = "/root/pingbell/pingbell.log"
+
+GLOBAL_DEFAULTS = {
+    "interval": "10",
+    "timeout": "3000",
+    "buzzer_mode": "driver",
+    "buzzer_dev": "",
+    "buzzer": "http://127.0.0.1:7773",
+    "fallback_http": "1",
+    "buzzer_enable": "1",
+    "alarm_freq": "2000",
+    "alarm_ms": "300",
+    "alarm_repeat": "3",
+    "alarm_gap": "150",
+    "max_alarms": "5",
+    "count": "1",
+    "log_file": DEFAULT_LOG,
+    "log_max_kb": "512",
+}
+
+RULE_DEFAULTS = {
+    "enabled": "0",
+    "group": "",
+    "type": "icmp",
+    "iface": "",
+    "host": "",
+    "port": "",
+    "interval": "",
+    "timeout": "",
+    "count": "",
+    "freq": "",
+    "ms": "",
+    "repeat": "",
+    "gap": "",
+    "max_alarms": "",
+    "msg": "",
+}
+
+
+#基础工具
+def run(cmd, timeout=10):
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           timeout=timeout)
+        return p.returncode, p.stdout.decode("utf-8", "replace"), \
+            p.stderr.decode("utf-8", "replace")
+    except Exception as e:
+        return 1, "", str(e)
+
+
+def now_str():
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def intval(v, d):
+    try:
+        return int(str(v).strip())
+    except Exception:
+        return d
+
+
+#UCI 读写
+def uci_show():
+    """-> (order, sections)；sections[sec] = {opt: val, '__type__': rule|global}"""
+    rc, out, _ = run(["uci", "-q", "show", CONF])
+    order, secs = [], {}
+    if rc != 0:
+        return order, secs
+    for line in out.splitlines():
+        key, _, val = line.partition("=")
+        val = val.strip()
+        if len(val) >= 2 and val[0] == "'" and val[-1] == "'":
+            val = val[1:-1]
+        parts = key.split(".")
+        if len(parts) < 2:
+            continue
+        sec = parts[1]
+        if len(parts) == 2:
+            if sec not in secs:
+                order.append(sec)
+            secs.setdefault(sec, {})["__type__"] = val
+        else:
+            secs.setdefault(sec, {})[parts[2]] = val
+    return order, secs
+
+
+def uci_set(pairs):
+    """pairs = [(key, value), ...]  key 形如 rule_x.host"""
+    for k, v in pairs:
+        run(["uci", "-q", "set", "%s.%s=%s" % (CONF, k, v)])
+    run(["uci", "-q", "commit", CONF])
+
+
+def load_conf():
+    order, secs = uci_show()
+    cfg = dict(GLOBAL_DEFAULTS)
+    rules = []
+    for sec in order:
+        d = secs.get(sec, {})
+        typ = d.get("__type__", "")
+        opts = {k: v for k, v in d.items() if k != "__type__"}
+        if typ == "global" or sec == "global":
+            cfg.update(opts)
+            continue
+        r = dict(RULE_DEFAULTS)
+        r.update(opts)
+        r["name"] = sec
+        rules.append(r)
+    return cfg, rules
+
+
+def val(cfg, rule, key):
+    """规则自己的值优先，空则回落全局。"""
+    v = str(rule.get(key, "") or "").strip()
+    if v == "":
+        v = str(cfg.get(key, "") or "").strip()
+    return v
+
+
+#出口地址
+_IFACE_CACHE = {}
+
+# 只给老配置兜底 写了 wan1 但系统里叫 wan。新配置用不到
+IFACE_ALIAS = {
+    "wan1": ["wan1", "wan"],
+    "wan2": ["wan2"],
+    "wan": ["wan"],
+}
+
+
+def iface_src(name):
+    """逻辑接口 其 IPv4 地址取不到就返回 None"""
+    if not name:
+        return None
+    ts, ip = _IFACE_CACHE.get(name, (0, None))
+    # 有地址缓存久些，没有的短些，别让轮询把 ifstatus 刷爆
+    if time.time() - ts < (60 if ip else 10):
+        return ip
+    ip = None
+    for cand in IFACE_ALIAS.get(name, [name]):
+        rc, out, _ = run(["ifstatus", cand], timeout=6)
+        if rc == 0 and out.strip():
+            try:
+                j = json.loads(out)
+                arr = j.get("ipv4-address") or []
+                if arr and arr[0].get("address"):
+                    ip = arr[0]["address"]
+                    break
+            except Exception:
+                pass
+    _IFACE_CACHE[name] = (time.time(), ip)
+    return ip
+
+
+def list_ifaces():
+
+    names = []
+    rc, out, _ = run(["ubus", "list", "network.interface"], timeout=6)
+    if rc == 0:
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("network.interface."):
+                n = line[len("network.interface."):].strip()
+                if n and "." not in n:
+                    names.append(n)
+
+    if not names:
+        rc, out, _ = run(["uci", "-q", "show", "network"], timeout=6)
+        if rc == 0:
+            for line in out.splitlines():
+                if line.endswith("=interface"):
+                    sec = line.split("=")[0].split(".")[-1].strip()
+                    if sec:
+                        names.append(sec)
+
+    res = []
+    for n in sorted(set(names)):
+        if n in ("loopback",):
+            continue
+        ip = iface_src(n)
+        res.append({"name": n, "ip": ip or "", "up": 1 if ip else 0})
+    return res
+
+
+#探测实现
+def _checksum(data):
+    s = 0
+    n = len(data) & ~1
+    for i in range(0, n, 2):
+        s += (data[i] << 8) + data[i + 1]
+    if len(data) & 1:
+        s += data[-1] << 8
+    while s >> 16:
+        s = (s & 0xFFFF) + (s >> 16)
+    return (~s) & 0xFFFF
+
+
+def icmp_ping(host, timeout_ms, src=None):
+    """-> (rtt_ms, err)；成功 rtt 为 float，失败 err 为字符串"""
+    try:
+        dst = socket.gethostbyname(host)
+    except Exception:
+        return None, "dns"
+    ident = random.randint(1, 0x7FFF)
+    seq = 1
+    payload = b"pingbell" + struct.pack("!d", time.time())
+    hdr = struct.pack("!BBHHH", 8, 0, 0, ident, seq)
+    ck = _checksum(hdr + payload)
+    pkt = struct.pack("!BBHHH", 8, 0, ck, ident, seq) + payload
+
+    s = None
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+        if src:
+            s.bind((src, 0))
+        t0 = time.perf_counter()
+        s.sendto(pkt, (dst, 0))
+        deadline = t0 + timeout_ms / 1000.0
+        while True:
+            left = deadline - time.perf_counter()
+            if left <= 0:
+                break
+            s.settimeout(left)
+            data, _addr = s.recvfrom(2048)
+            ihl = (data[0] & 0x0F) * 4
+            if len(data) < ihl + 8:
+                continue
+            typ, code, _c, rid, rseq = struct.unpack("!BBHHH", data[ihl:ihl + 8])
+            if typ == 0 and rid == ident and rseq == seq:
+                return (time.perf_counter() - t0) * 1000.0, None
+            if typ == 3:
+                return None, "unreachable"
+    except socket.timeout:
+        return None, "timeout"
+    except PermissionError:
+        return None, "no-perm"
+    except Exception as e:
+        return None, "err:%s" % e
+    finally:
+        if s is not None:
+            try:
+                s.close()
+            except Exception:
+                pass
+    return None, "timeout"
+
+
+def tcp_ping(host, port, timeout_ms, src=None):
+    try:
+        dst = socket.gethostbyname(host)
+    except Exception:
+        return None, "dns"
+    port = int(port)
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout_ms / 1000.0)
+    t0 = time.perf_counter()
+    try:
+        if src:
+            s.bind((src, 0))
+        rc = s.connect_ex((dst, port))
+        dt = (time.perf_counter() - t0) * 1000.0
+        if rc == 0:
+            return dt, None
+        if rc == 111:
+            return None, "refused"
+        if rc in (11, 110, 115):        # EAGAIN/ETIMEDOUT/EINPROGRESS = 没按时连上
+            return None, "timeout"
+        if rc in (101, 113):
+            return None, "unreachable"
+        return None, "rc%d" % rc
+    except socket.timeout:
+        return None, "timeout"
+    except PermissionError:
+        return None, "no-perm"
+    except Exception as e:
+        return None, "err:%s" % e
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
+def check_rule(cfg, rule):
+    """跑一次检测（内部按 count 重试）。-> dict(ok, rtt, err, tries, src)"""
+    typ = (rule.get("type") or "icmp").strip().lower()
+    host = (rule.get("host") or "").strip()
+    tmo = intval(val(cfg, rule, "timeout"), 3000)
+    tries = max(1, intval(val(cfg, rule, "count"), 1))
+    iface = (rule.get("iface") or "").strip()
+    src = iface_src(iface) if iface else None
+
+    if not host:
+        return {"ok": False, "rtt": None, "err": "no-host", "tries": 0, "src": src}
+    if iface and not src:
+        return {"ok": False, "rtt": None, "err": "no-src(%s)" % iface,
+                "tries": 0, "src": None}
+
+    last = {"ok": False, "rtt": None, "err": "timeout", "tries": 0, "src": src}
+    for i in range(tries):
+        last["tries"] = i + 1
+        if typ == "tcping":
+            port = val(cfg, rule, "port")
+            if not port:
+                return {"ok": False, "rtt": None, "err": "no-port",
+                        "tries": i, "src": src}
+            rtt, err = tcp_ping(host, port, tmo, src)
+        else:
+            rtt, err = icmp_ping(host, tmo, src)
+        last.update(ok=(err is None), rtt=rtt, err=err)
+        if last["ok"]:
+            return last
+    return last
+
+
+EV_SND = 0x12
+SND_TONE = 0x02
+
+
+class Speaker(object):
+    def __init__(self, dev=""):
+        self.dev = dev
+        self.fd = -1
+        self.err = None
+
+    @staticmethod
+    def autodetect():
+        """在 /sys 里按设备名找 PC Speaker，再退一步看 by-path。"""
+        for p in sorted(glob.glob("/sys/class/input/event*/device/name")):
+            try:
+                with open(p, "r", errors="replace") as f:
+                    if f.read().strip().lower() == "pc speaker":
+                        return "/dev/input/" + p.split("/")[4]
+            except Exception:
+                pass
+        for p in sorted(glob.glob("/dev/input/by-path/*pcspkr*")):
+            return p
+        return ""
+
+    def open(self):
+        if self.fd >= 0:
+            return True
+        dev = self.dev or self.autodetect()
+        if not dev:
+            self.err = "找不到 PC Speaker（opkg install kmod-pcspkr && modprobe snd-pcsp）"
+            return False
+        try:
+            self.fd = os.open(dev, os.O_WRONLY)
+            self.dev = dev
+            return True
+        except PermissionError:
+            self.err = ("无权写 %s（需要 root，当前 uid=%d）"
+                        % (dev, os.geteuid()))
+            return False
+        except Exception as e:
+            self.err = "%s: %s" % (dev, e)
+            return False
+
+    def tone(self, freq):
+        if not self.open():
+            return False
+        try:
+            os.write(self.fd, struct.pack("<qqHHi", 0, 0, EV_SND, SND_TONE, int(freq)))
+            return True
+        except Exception as e:
+            self.err = str(e)
+            try:
+                os.close(self.fd)
+            except Exception:
+                pass
+            self.fd = -1
+            return False
+
+    def close(self):
+        try:
+            if self.fd >= 0:
+                os.write(self.fd, struct.pack("<qqHHi", 0, 0, EV_SND, SND_TONE, 0))
+                os.close(self.fd)
+        except Exception:
+            pass
+        self.fd = -1
+
+
+_SPK = None
+
+
+def driver_beep(freq, ms, repeat, gap, dev=""):
+    """-> (ok, dev_or_err)"""
+    global _SPK
+    if _SPK is None or (dev and _SPK.dev != dev):
+        _SPK = Speaker(dev)
+    ok = False
+    for i in range(max(1, repeat)):
+        if not _SPK.tone(freq):
+            return False, _SPK.err or "write failed"
+        ok = True
+        time.sleep(ms / 1000.0)
+        _SPK.tone(0)
+        if i < max(1, repeat) - 1 and gap > 0:
+            time.sleep(gap / 1000.0)
+    return ok, _SPK.dev
+
+
+def beep_http(cfg, freq, ms, repeat, gap, force=1):
+    base = (cfg.get("buzzer") or "").rstrip("/")
+    if not base:
+        return False
+    url = "%s/beep?freq=%d&ms=%d&repeat=%d&gap=%d&force=%d" % (
+        base, int(freq), int(ms), int(repeat), int(gap), 1 if force else 0)
+    try:
+        with urllib.request.urlopen(url, timeout=6) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+def alarm_sound(cfg, freq, ms, repeat, gap):
+    """按 buzzer_mode 发声。-> (ok, 说明文字)"""
+    mode = (cfg.get("buzzer_mode") or "driver").strip().lower()
+    if mode == "http":
+        ok = beep_http(cfg, freq, ms, repeat, gap)
+        return ok, "http(%s)" % (cfg.get("buzzer") or "-")
+
+    ok, info = driver_beep(freq, ms, repeat, gap,
+                           (cfg.get("buzzer_dev") or "").strip())
+    if ok:
+        return True, "driver(%s)" % info
+    # 驱动不可用时按需回退到 HTTP GITHUB下载的应该用不到，因为没我openwrt的API环境 忽略即可
+    if str(cfg.get("fallback_http", "1")).strip() in ("1", "on", "yes", "true") \
+            and (cfg.get("buzzer") or "").strip():
+        ok2 = beep_http(cfg, freq, ms, repeat, gap)
+        return ok2, "driver失败(%s)→http%s" % (info, "" if ok2 else "也失败")
+    return False, "driver失败(%s)" % info
+
+
+def rule_alarm_params(cfg, rule):
+    return (intval(val(cfg, rule, "freq"), 2000),
+            intval(val(cfg, rule, "ms"), 300),
+            intval(val(cfg, rule, "repeat"), 3),
+            intval(val(cfg, rule, "gap"), 150))
+
+
+def log_line(cfg, text):
+    path = cfg.get("log_file") or DEFAULT_LOG
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+    except Exception:
+        return
+    try:
+        maxkb = intval(cfg.get("log_max_kb"), 512)
+        if maxkb > 0 and os.path.exists(path) and os.path.getsize(path) > maxkb * 1024:
+            try:
+                os.replace(path, path + ".1")
+            except Exception:
+                pass
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("%s %s\n" % (now_str(), text))
+    except Exception:
+        pass
+
+
+def do_alarm(cfg, rule, res, st):
+    """报警一次 达到 max_alarms 后自动停用该规则"""
+    if str(cfg.get("buzzer_enable", "1")).strip() not in ("1", "on", "yes", "true"):
+        log_line(cfg, "[SKIP] %s 报警被禁用 buzzer_enable=0" % rule["name"])
+        return
+    freq, ms, repeat, gap = rule_alarm_params(cfg, rule)
+    ok, how = alarm_sound(cfg, freq, ms, repeat, gap)
+    msg = (rule.get("msg") or "").strip() or "不通"
+    st["alarms"] = st.get("alarms", 0) + 1
+    st["last_alarm"] = now_str()
+    limit = intval(val(cfg, rule, "max_alarms"), 0)
+    log_line(cfg, "[ALARM] %s %s host=%s iface=%s err=%s 发声=%s %s 第%d次%s"
+             % (rule["name"], msg, rule.get("host"), rule.get("iface") or "-",
+                res.get("err"), "ok" if ok else "FAIL", how,
+                st["alarms"], ("/上限%d" % limit) if limit > 0 else ""))
+    if limit > 0 and st["alarms"] >= limit:
+        uci_set([("%s.enabled" % rule["name"], "0")])
+        rule["enabled"] = "0"          # 内存里也置 0
+        log_line(cfg, "[AUTO-OFF] %s 已达报警上限 %d 次，已自动停用"
+                 % (rule["name"], limit))
+
+
+#守护进程
+def write_state(state):
+    tmp = STATE_PATH + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False)
+        os.replace(tmp, STATE_PATH)
+    except Exception:
+        pass
+
+
+def uci_raw():
+    rc, out, _ = run(["uci", "-q", "show", CONF])
+    return out if rc == 0 else ""
+
+
+def daemon():
+    if os.geteuid() != 0:
+        print("PingBell daemon 需要 root（当前 uid=%d）" % os.geteuid())
+        return 1
+    if os.path.exists(PID_PATH):
+        try:
+            with open(PID_PATH) as f:
+                old = int(f.read().strip())
+            os.kill(old, 0)
+            print("PingBell 已在运行 pid=%d" % old)
+            return 1
+        except Exception:
+            pass
+    try:
+        with open(PID_PATH, "w") as f:
+            f.write(str(os.getpid()))
+    except PermissionError:
+        print("无法写 %s（需要 root）" % PID_PATH)
+        return 1
+
+    reload_flag = {"v": False}
+
+    def _hup(_s, _f):
+        reload_flag["v"] = True
+
+    def _term(_s, _f):
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGHUP, _hup)
+    signal.signal(signal.SIGTERM, _term)
+    signal.signal(signal.SIGINT, _term)
+
+    cfg, rules = load_conf()
+    state = {"pid": os.getpid(), "started": now_str(), "ts": 0, "rules": {}}
+    due = {}
+    last_raw = uci_raw()
+    tick = 0
+    log_line(cfg, "[START] PingBell 启动 pid=%d 规则数=%d" % (os.getpid(), len(rules)))
+
+    while True:
+        tick += 1
+        if reload_flag["v"]:
+            reload_flag["v"] = False
+            cfg, rules = load_conf()
+            last_raw = uci_raw()
+            log_line(cfg, "[RELOAD] 重读配置，规则数=%d" % len(rules))
+        elif tick % 10 == 0:
+            # 有人直接用 uci 改了配置没发 HUP，这里兜住
+            cur = uci_raw()
+            if cur != last_raw:
+                last_raw = cur
+                cfg, rules = load_conf()
+                log_line(cfg, "[RELOAD] 检测到配置变化，规则数=%d" % len(rules))
+
+        now = time.time()
+        for rule in rules:
+            name = rule["name"]
+            if str(rule.get("enabled", "0")).strip() not in ("1", "on", "yes", "true"):
+                st = state["rules"].get(name, {})
+                st.update({"enabled": False})
+                state["rules"][name] = st
+                continue
+            intv = max(2, intval(val(cfg, rule, "interval"), 10))
+            if due.get(name, 0) > now:
+                continue
+            due[name] = now + intv
+
+            st = state["rules"].setdefault(name, {"ok": None, "rtt": None, "err": None,
+                                                  "fails": 0, "alarms": 0})
+            st["enabled"] = True
+            res = check_rule(cfg, rule)
+            st["ts"] = now_str()
+            st["rtt"] = round(res["rtt"], 1) if res.get("rtt") is not None else None
+            st["err"] = res.get("err")
+            st["src"] = res.get("src")
+            st["host"] = rule.get("host")
+            st["iface"] = rule.get("iface") or ""
+            st["type"] = rule.get("type")
+
+            if res["ok"]:
+                if st.get("ok") is False:
+                    log_line(cfg, "[OK] %s 恢复 host=%s rtt=%.1fms"
+                             % (name, rule.get("host"), res["rtt"] or 0))
+                st["ok"] = True
+                st["fails"] = 0
+            else:
+                st["ok"] = False
+                st["fails"] = st.get("fails", 0) + 1
+                do_alarm(cfg, rule, res, st)
+
+        state["ts"] = time.time()
+        write_state(state)
+        time.sleep(1)
+
+
+#CLI 展示
+def fmt_bool(v):
+    return "开" if v else "关"
+
+
+def _w(s):
+    """显示宽度：中文算 2 格"""
+    return sum(2 if ord(ch) > 0x2E80 else 1 for ch in str(s))
+
+
+def pad(s, width):
+    s = str(s)
+    return s + " " * max(0, width - _w(s))
+
+
+def cmd_status():
+    cfg, rules = load_conf()
+    state = {}
+    try:
+        with open(STATE_PATH, encoding="utf-8") as f:
+            state = json.load(f)
+    except Exception:
+        pass
+    pid = state.get("pid")
+    alive = False
+    if pid:
+        try:
+            os.kill(int(pid), 0)
+            alive = True
+        except Exception:
+            alive = False
+
+    print("PingBell 链路健康检测")
+    print("  守护进程 : %s" % ("运行中 pid=%s" % pid if alive
+                              else "未运行（/etc/init.d/pingbell start）"))
+    if state.get("ts"):
+        print("  最近刷新 : %s（%.0f 秒前）"
+              % (time.strftime("%H:%M:%S", time.localtime(state["ts"])),
+                 time.time() - state["ts"]))
+    print("  全局参数 : 间隔=%ss 超时=%sms 报警=%dHz/%dms×%d 自动关闭=%s次"
+          % (cfg.get("interval"), cfg.get("timeout"), intval(cfg.get("alarm_freq"), 2000),
+             intval(cfg.get("alarm_ms"), 300), intval(cfg.get("alarm_repeat"), 3),
+             cfg.get("max_alarms")))
+    mode = (cfg.get("buzzer_mode") or "driver").strip().lower()
+    if mode == "http":
+        print("  发声后端 : http -> %s" % (cfg.get("buzzer") or "-"))
+    else:
+        dev = (cfg.get("buzzer_dev") or "").strip() or Speaker.autodetect()
+        print("  发声后端 : driver -> %s%s"
+              % (dev or "未找到 PC Speaker",
+                 "" if dev else "（kmod-pcspkr / modprobe snd-pcsp）"))
+    print("")
+    if not rules:
+        print("  没有规则（pingbell add <名字> type=icmp iface=<接口> host=1.1.1.1）")
+        return 0
+
+    cols = (14, 7, 7, 18, 14, 8, 8)
+    print("  " + pad("名字", cols[0]) + pad("类型", cols[1]) + pad("出口", cols[2])
+          + pad("目标", cols[3]) + pad("状态", cols[4]) + pad("RTT", cols[5]) + "失败/报警")
+    print("  " + "-" * 76)
+    for r in rules:
+        name = r["name"]
+        st = state.get("rules", {}).get(name, {})
+        en = str(r.get("enabled", "0")).strip() in ("1", "on", "yes", "true")
+        typ = r.get("type") or "icmp"
+        host = r.get("host") or "-"
+        if typ == "tcping" and r.get("port"):
+            host = "%s:%s" % (host, r["port"])
+        iface = r.get("iface") or "本机"
+        if not en:
+            status, rtt = "关闭", "-"
+        elif st.get("ok") is None:
+            status, rtt = "待检测", "-"
+        elif st.get("ok"):
+            status, rtt = "通", ("%.1fms" % st["rtt"]) if st.get("rtt") else "-"
+        else:
+            status = "不通:%s" % (st.get("err") or "?")
+            rtt = "-"
+        print("  " + pad(name, cols[0]) + pad(typ, cols[1]) + pad(iface, cols[2])
+              + pad(host, cols[3]) + pad(status, cols[4]) + pad(rtt, cols[5])
+              + "%d/%d" % (st.get("fails", 0), st.get("alarms", 0)))
+    print("")
+    print("  单条开关: pingbell on|off <名字>    批量: pingbell on|off all")
+    print("  立即检测: pingbell test <名字>     改参数: pingbell set <名字> key=value")
+    return 0
+
+
+def rule_group(r):
+    """link=链路监控，lan=内网监控。写了 group 就听它的，没写就看绑没绑 iface。"""
+    g = str(r.get("group", "") or "").strip().lower()
+    if g in ("link", "lan"):
+        return g
+    iface = str(r.get("iface", "") or "").strip()
+    return "link" if iface else "lan"
+
+
+def cmd_report():
+    """给 LuCI 用的机器可读输出（单行 JSON）。"""
+    cfg, rules = load_conf()
+    state = {}
+    try:
+        with open(STATE_PATH, encoding="utf-8") as f:
+            state = json.load(f)
+    except Exception:
+        pass
+
+    pid = state.get("pid")
+    alive = False
+    if pid:
+        try:
+            os.kill(int(pid), 0)
+            alive = True
+        except Exception:
+            alive = False
+
+    out = {
+        "daemon": {
+            "running": alive,
+            "pid": pid,
+            "age": round(time.time() - state["ts"], 1) if state.get("ts") else None,
+        },
+        "global": {k: cfg.get(k, "") for k in
+                   ("interval", "timeout", "count", "alarm_freq", "alarm_ms",
+                    "alarm_repeat", "alarm_gap", "max_alarms", "buzzer_enable")},
+        "speaker": (cfg.get("buzzer_dev") or "").strip() or Speaker.autodetect(),
+        "interfaces": list_ifaces(),
+        "rules": [],
+    }
+
+    for r in rules:
+        st = state.get("rules", {}).get(r["name"], {})
+        en = str(r.get("enabled", "0")).strip() in ("1", "on", "yes", "true")
+        ok = st.get("ok")
+        out["rules"].append({
+            "name": r["name"],
+            "group": rule_group(r),
+            "enabled": 1 if en else 0,
+            "type": r.get("type") or "icmp",
+            "iface": r.get("iface") or "",
+            "host": r.get("host") or "",
+            "port": r.get("port") or "",
+            "timeout": intval(val(cfg, r, "timeout"), 3000),
+            "count": intval(val(cfg, r, "count"), 1),
+            "interval": intval(val(cfg, r, "interval"), 10),
+            "freq": intval(val(cfg, r, "freq"), 2000),
+            "ms": intval(val(cfg, r, "ms"), 300),
+            "repeat": intval(val(cfg, r, "repeat"), 3),
+            "gap": intval(val(cfg, r, "gap"), 150),
+            "max_alarms": intval(val(cfg, r, "max_alarms"), 5),
+            "msg": r.get("msg") or "",
+            "ok": 1 if ok else (0 if ok is False else -1),
+            "rtt": st.get("rtt"),
+            "err": st.get("err") or "",
+            "fails": st.get("fails", 0),
+            "alarms": st.get("alarms", 0),
+            "checked": st.get("ts") or "",
+        })
+
+    print(json.dumps(out, ensure_ascii=False))
+    return 0
+
+
+def cmd_list():
+    cfg, rules = load_conf()
+    for r in rules:
+        en = "on " if str(r.get("enabled", "0")).strip() in ("1", "on", "yes", "true") else "off"
+        tgt = r.get("host") or "-"
+        if (r.get("type") or "") == "tcping":
+            tgt = "%s:%s" % (tgt, r.get("port") or "?")
+        print("%s  %s%s%s%s%s" % (
+            en, pad(r["name"], 14), pad(r.get("type"), 7),
+            pad(r.get("iface") or "-", 7), pad(tgt, 20), r.get("msg") or ""))
+    if not rules:
+        print("(无规则)")
+    return 0
+
+
+def cmd_show(name):
+    cfg, rules = load_conf()
+    r = next((x for x in rules if x["name"] == name), None)
+    if not r:
+        print("没有这条规则：%s" % name)
+        return 1
+    st = {}
+    try:
+        with open(STATE_PATH, encoding="utf-8") as f:
+            st = json.load(f).get("rules", {}).get(name, {})
+    except Exception:
+        pass
+    print("规则 %s" % name)
+    keys = ["enabled", "group", "type", "iface", "host", "port", "interval", "timeout",
+            "count", "freq", "ms", "repeat", "gap", "max_alarms", "msg"]
+    inherit_keys = {"interval", "timeout", "count", "freq", "ms", "repeat",
+                    "gap", "max_alarms"}
+    for k in keys:
+        raw = str(r.get(k, "") or "").strip()
+        eff = val(cfg, r, k)
+        mark = "  (继承全局)" if (k in inherit_keys and not raw) else ""
+        print("  %-11s %s%s" % (k, eff if eff != "" else "-", mark))
+    print("  最近状态   %s host=%s src=%s rtt=%s err=%s 失败=%s 报警=%s"
+          % (st.get("ts", "-"), st.get("host", "-"), st.get("src", "-"),
+             st.get("rtt", "-"), st.get("err") or "-",
+             st.get("fails", 0), st.get("alarms", 0)))
+    return 0
+
+
+def _targets(names):
+    _cfg, rules = load_conf()
+    allnames = [r["name"] for r in rules]
+    if not names:
+        return []
+    if "all" in names:
+        return allnames
+    return [n for n in names if n in allnames]
+
+
+def cmd_switch(on, names):
+    todo = _targets(names)
+    if not todo:
+        print("没有匹配的规则；用 pingbell list 看看名字")
+        return 1
+    uci_set([("%s.enabled" % n, "1" if on else "0") for n in todo])
+    print("已%s %d 条：%s" % ("启用" if on else "停用", len(todo), " ".join(todo)))
+    hup_daemon()
+    return 0
+
+
+def cmd_reset(names):
+    todo = _targets(names)
+    if not todo:
+        print("没有匹配的规则")
+        return 1
+    try:
+        with open(STATE_PATH, encoding="utf-8") as f:
+            state = json.load(f)
+    except Exception:
+        state = {"rules": {}}
+    for n in todo:
+        st = state.get("rules", {}).get(n)
+        if st:
+            st["alarms"] = 0
+            st["fails"] = 0
+    write_state(state)
+    print("已清零 %d 条计数：%s" % (len(todo), " ".join(todo)))
+    return 0
+
+
+VALID_KEYS = set(RULE_DEFAULTS.keys()) | set(GLOBAL_DEFAULTS.keys())
+
+
+def _kv(args):
+    out = []
+    for a in args:
+        if "=" not in a:
+            print("参数要写成 key=value：%s" % a)
+            return None
+        k, _, v = a.partition("=")
+        if k not in VALID_KEYS:
+            print("未知参数：%s（可用：%s）" % (k, ", ".join(sorted(VALID_KEYS))))
+            return None
+        out.append((k, v))
+    return out
+
+
+def cmd_set(name, args):
+    pairs = _kv(args)
+    if pairs is None:
+        return 1
+    _cfg, rules = load_conf()
+    if name != "global" and not any(r["name"] == name for r in rules):
+        print("没有这条规则：%s" % name)
+        return 1
+    uci_set([("%s.%s" % (name, k), v) for k, v in pairs])
+    print("已更新 %s：%s" % (name, "  ".join("%s=%s" % kv for kv in pairs)))
+    hup_daemon()
+    return 0
+
+
+def cmd_add(name, args):
+    pairs = _kv(args)
+    if pairs is None:
+        return 1
+    if not re.match(r"^[A-Za-z0-9_]+$", name):
+        print("名字只能用字母数字下划线")
+        return 1
+    _cfg, rules = load_conf()
+    if any(r["name"] == name for r in rules):
+        print("规则已存在：%s（用 set 改它）" % name)
+        return 1
+    if not any(k == "type" for k, _ in pairs):
+        pairs.insert(0, ("type", "icmp"))
+    if not any(k == "enabled" for k, _ in pairs):
+        pairs.append(("enabled", "1"))
+    run(["uci", "-q", "set", "%s.%s=rule" % (CONF, name)])
+    uci_set([("%s.%s" % (name, k), v) for k, v in pairs])
+    print("已新增规则 %s：%s" % (name, "  ".join("%s=%s" % kv for kv in pairs)))
+    hup_daemon()
+    return 0
+
+
+def cmd_del(name):
+    _cfg, rules = load_conf()
+    if not any(r["name"] == name for r in rules):
+        print("没有这条规则：%s" % name)
+        return 1
+    run(["uci", "-q", "delete", "%s.%s" % (CONF, name)])
+    run(["uci", "-q", "commit", CONF])
+    print("已删除规则 %s" % name)
+    hup_daemon()
+    return 0
+
+
+def cmd_test(name):
+    cfg, rules = load_conf()
+    r = next((x for x in rules if x["name"] == name), None)
+    if not r:
+        print("没有这条规则：%s" % name)
+        return 1
+    t0 = time.time()
+    res = check_rule(cfg, r)
+    dt = (time.time() - t0) * 1000
+    print("规则 %s  type=%s host=%s%s iface=%s src=%s 超时=%sms"
+          % (name, r.get("type"), r.get("host"),
+             (":" + str(r.get("port"))) if (r.get("type") == "tcping" and r.get("port")) else "",
+             r.get("iface") or "-", res.get("src") or "-", val(cfg, r, "timeout")))
+    if res["ok"]:
+        print("  结果: 通  rtt=%.1fms  用时 %.0fms" % (res["rtt"] or 0, dt))
+        return 0
+    print("  结果: 不通  err=%s  用时 %.0fms" % (res.get("err"), dt))
+    return 2
+
+
+def cmd_beep(args):
+    kv = {}
+    for a in args:
+        k, _, v = a.partition("=")
+        kv[k] = v
+    cfg, _ = load_conf()
+    f = intval(kv.get("freq"), 2000)
+    ms = intval(kv.get("ms"), 300)
+    rep = intval(kv.get("repeat"), 3)
+    gap = intval(kv.get("gap"), 150)
+    ok, how = alarm_sound(cfg, f, ms, rep, gap)
+    print("蜂鸣器 %s：freq=%d ms=%d repeat=%d gap=%d  后端=%s"
+          % ("已响" if ok else "失败", f, ms, rep, gap, how))
+    return 0 if ok else 1
+
+
+def cmd_doctor(args):
+    """一条命令把"为什么发不出声 / 为什么没权限"查清楚。"""
+    fails = []
+
+    def item(ok, label, detail="", fix=""):
+        if not ok:
+            fails.append(label)
+        print("  %s %s%s" % ("[ OK ]" if ok else "[FAIL]", pad(label, 22),
+                             ("  " + detail) if detail else ""))
+        if not ok and fix:
+            print("         → %s" % fix)
+
+    print("PingBell 自检")
+    print("")
+
+    uid = os.geteuid()
+    item(uid == 0, "运行身份", "uid=%d (%s)" % (uid, "root" if uid == 0 else "非 root"),
+         "必须用 root 运行：写 /dev/input/eventN、uci、procd 都需要")
+
+    item(sys.version_info >= (3, 6), "Python", sys.version.split()[0],
+         "opkg update && opkg install python3-light")
+
+    cfg, rules = load_conf()
+    item(bool(cfg), "配置 /etc/config/pingbell", "规则 %d 条" % len(rules),
+         "cp 一份默认配置到 /etc/config/pingbell")
+
+    mode = (cfg.get("buzzer_mode") or "driver").strip().lower()
+    if mode == "http":
+        base = (cfg.get("buzzer") or "").rstrip("/")
+        ok = False
+        try:
+            with urllib.request.urlopen(base + "/health", timeout=4) as r:
+                ok = r.status == 200
+        except Exception as e:
+            ok = False
+            base = "%s (%s)" % (base, e)
+        item(ok, "HTTP 后端", base, "确认 buzzerd 在跑，或改回 buzzer_mode=driver")
+    else:
+        dev = (cfg.get("buzzer_dev") or "").strip() or Speaker.autodetect()
+        item(bool(dev), "PC Speaker 设备", dev or "未找到",
+             "opkg install kmod-pcspkr && modprobe snd-pcsp")
+        if dev:
+            perm, err = True, ""
+            try:
+                fd = os.open(dev, os.O_WRONLY)
+                os.close(fd)
+            except Exception as e:
+                perm, err = False, str(e)
+            item(perm, "设备写权限", "%s %s" % (dev, "可写" if perm else "不可写：" + err),
+                 "以 root 运行（该节点通常是 crw------- root:root）")
+            if perm and "--beep" in args:
+                good, how = driver_beep(1500, 150, 2, 80)
+                item(good, "实际发声", str(how), "检查主板是否接了蜂鸣器")
+
+    logdir = os.path.dirname(cfg.get("log_file") or DEFAULT_LOG) or "/"
+    for label, path, is_dir in (
+            ("状态文件目录", "/tmp", True),
+            ("日志目录", logdir, True),
+            ("pid 目录", "/var/run", True)):
+        ok = os.access(path, os.W_OK)
+        item(ok, label, "%s %s" % (path, "可写" if ok else "不可写"),
+             "以 root 运行")
+
+    pid, alive = None, False
+    try:
+        with open(PID_PATH) as f:
+            pid = int(f.read().strip())
+        os.kill(pid, 0)
+        alive = True
+    except Exception:
+        pass
+    item(alive, "守护进程", ("pid=%d 运行中" % pid) if alive else "未运行",
+         "/etc/init.d/pingbell start")
+
+    print("")
+    if fails:
+        print("有 %d 项没通过：%s" % (len(fails), "、".join(fails)))
+        return 1
+    print("全部通过。")
+    if "--beep" not in args:
+        print("（想顺便听一声：pingbell doctor --beep）")
+    return 0
+
+
+def cmd_log(args):
+    n = 30
+    for i, a in enumerate(args):
+        if a in ("-n", "--lines") and i + 1 < len(args):
+            n = intval(args[i + 1], 30)
+    cfg, _ = load_conf()
+    path = cfg.get("log_file") or DEFAULT_LOG
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+    except Exception:
+        print("还没有日志：%s" % path)
+        return 0
+    for line in lines[-n:]:
+        sys.stdout.write(line)
+    return 0
+
+
+def hup_daemon():
+    try:
+        with open(PID_PATH) as f:
+            pid = int(f.read().strip())
+        os.kill(pid, signal.SIGHUP)
+    except Exception:
+        print("（守护进程未运行，改动将在下次启动生效）")
+
+
+def usage():
+    print(__doc__.strip())
+    return 0
+
+
+def main(argv):
+    if len(argv) < 2:
+        return usage()
+    cmd, args = argv[1], argv[2:]
+    if cmd in ("status", "st"):
+        return cmd_status()
+    if cmd in ("report", "json"):
+        return cmd_report()
+    if cmd == "list" or cmd == "ls":
+        return cmd_list()
+    if cmd == "show":
+        return cmd_show(args[0]) if args else usage()
+    if cmd == "on":
+        return cmd_switch(True, args)
+    if cmd == "off":
+        return cmd_switch(False, args)
+    if cmd == "set":
+        return cmd_set(args[0], args[1:]) if len(args) >= 2 else usage()
+    if cmd == "add":
+        return cmd_add(args[0], args[1:]) if len(args) >= 1 else usage()
+    if cmd == "del":
+        return cmd_del(args[0]) if args else usage()
+    if cmd == "reset":
+        return cmd_reset(args)
+    if cmd == "test":
+        return cmd_test(args[0]) if args else usage()
+    if cmd == "beep":
+        return cmd_beep(args)
+    if cmd in ("doctor", "doc", "check"):
+        return cmd_doctor(args)
+    if cmd == "log":
+        return cmd_log(args)
+    if cmd == "reload":
+        hup_daemon()
+        print("已发送重载信号")
+        return 0
+    if cmd == "daemon":
+        return daemon()
+    return usage()
+
+
+if __name__ == "__main__":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+    try:
+        sys.exit(main(sys.argv))
+    except PermissionError as e:
+        # 基本都是没 root 还想写 /dev/input/eventN
+        sys.stderr.write("权限不足：%s\n" % e)
+        if os.geteuid() != 0:
+            sys.stderr.write("PingBell 需要 root（当前 uid=%d）。"
+                             "请用 root 运行，例如： su -c 'pingbell doctor'\n"
+                             % os.geteuid())
+        else:
+            sys.stderr.write("用 pingbell doctor 看看是哪一项。\n")
+        sys.exit(13)
+    except KeyboardInterrupt:
+        sys.exit(130)
